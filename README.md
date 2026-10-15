@@ -1,1 +1,56 @@
-# weather-alert
+yaml
+
+
+name: 天气预警监测
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weather-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 恢复推送记录（去重状态）
+        uses: actions/cache@v4
+        with:
+          path: state.db
+          key: wa-state-${{ github.run_id }}
+          restore-keys: |
+            wa-state-
+
+      - name: 生成配置（密钥由 Secrets 注入，不写入代码库）
+        run: cp config.example.json config.json
+
+      - name: 运行监测并推送到手机
+        env:
+          WA_BARK_KEY: ${{ secrets.BARK_KEY }}
+          WA_SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: python main.py
+
+      - name: 心跳保活
+        run: |
+          if [ ! -f heartbeat.txt ] || [ -n "$(find heartbeat.txt -mtime +6 2>/dev/null)" ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add heartbeat.txt
+            git commit -m "chore: keep-alive heartbeat" || true
+            git push || true
+          fi
