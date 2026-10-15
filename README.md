@@ -1,56 +1,377 @@
-yaml
+# 指定地区天气预警主动推送工具
 
+一个**轻量、可真实运行**的天气预警订阅推送工具：你自己选择几个省/市/区县，系统后台持续监测这些地区的**官方气象预警**，一旦出现符合条件的新预警，就**主动推送**到你的手机（锁屏通知 / 微信 / 邮件）。不需要打开网页、不需要每天手动查询。
 
-name: 天气预警监测
+面向企业班车安全管理的典型用法：把班车途经的市/区县加入关注，只接收橙色、红色等高影响级别，以及台风、暴雨、大风、大雾、道路结冰等影响出行的类型。
 
-on:
-  schedule:
-    - cron: '*/10 * * * *'
-  workflow_dispatch:
+---
 
-permissions:
-  contents: write
+## 一、它能做什么 / 不做什么
 
-concurrency:
-  group: weather-alert
-  cancel-in-progress: false
+**只做一件事：监测你指定地区的官方预警 → 主动推送给你。**
 
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
+- ✅ 关注省、市、区县（可精确到区县，支持多个地区）
+- ✅ 只推送**天气预警**，不推送普通天气预报、温度、趋势图
+- ✅ 覆盖台风、暴雨、暴雪、寒潮、大风、雷电、冰雹、强对流（雷雨大风）、大雾、道路结冰等类型
+- ✅ 按**预警类型**、**预警级别**（蓝/黄/橙/红）分别设置规则
+- ✅ 同一条预警不重复发送；**升级/降级/解除**会再次通知
+- ✅ 后台自动运行（Windows 计划任务），无需打开任何页面
+- ✅ 运行失败会记录日志，并在可用渠道内提醒（详见"故障处理"）
+- ❌ 不做班车线路管理、地图分析、数据统计、全国天气罗列
 
-      - name: 安装 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+---
 
-      - name: 恢复推送记录（去重状态）
-        uses: actions/cache@v4
-        with:
-          path: state.db
-          key: wa-state-${{ github.run_id }}
-          restore-keys: |
-            wa-state-
+## 二、数据来源（真实官方数据，非模拟）
 
-      - name: 生成配置（密钥由 Secrets 注入，不写入代码库）
-        run: cp config.example.json config.json
+预警数据来自**国家气象中心 / 中央气象台**（`www.nmc.cn`）的公开预警接口：
 
-      - name: 运行监测并推送到手机
-        env:
-          WA_BARK_KEY: ${{ secrets.BARK_KEY }}
-          WA_SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-        run: python main.py
+| 项目 | 说明 |
+| --- | --- |
+| 接口 | `GET https://www.nmc.cn/rest/findAlarm`（全国现行预警信号列表） |
+| 详情 | `https://www.nmc.cn/publish/alarm/{alertid}.html`（预警正文、发布日期、防御指南） |
+| 地区解析 | `GET https://www.nmc.cn/rest/province/all`（34 个省级区划） |
+| 是否需注册 | **不需要**，无需 API Key、无需登录 |
+| 费用 | **免费** |
 
-      - name: 心跳保活
-        run: |
-          if [ ! -f heartbeat.txt ] || [ -n "$(find heartbeat.txt -mtime +6 2>/dev/null)" ]; then
-            date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add heartbeat.txt
-            git commit -m "chore: keep-alive heartbeat" || true
-            git push || true
-          fi
+> 每次运行会一次性拉取全国现行预警列表（约数百条），然后在本地按你配置的地区/类型/级别过滤。预警标题形如 `海南省文昌市气象台发布雷电黄色预警信号`，从中可解析出**地区、机构、类型、级别**；再抓取详情页拿到**发布时间、预警正文（含有效时段）、防御指南、原文链接**。
+
+---
+
+## 三、技术方案与目录结构
+
+- 语言：**Python 3.10+**（本机已内置 3.12），**零第三方依赖**，只用标准库，无需 `pip install`。
+- 存储：SQLite 单文件 `state.db`（记录已推送/生效状态，用于去重与升级/解除判断）。
+- 调度：`main.py`（单次运行）+ Windows 计划任务（每 N 分钟自动运行）。
+
+```
+weather-alert-push/
+├── main.py               # 入口（单次 / --loop / --dry-run / --status / --list-provinces）
+├── config.json           # 你的配置（地区 + 规则 + 推送渠道）
+├── config.example.json   # 配置示例
+├── source.py             # 中央气象台数据采集
+├── parse.py              # 预警标题解析
+├── matcher.py            # 地区/类型/级别规则匹配
+├── store.py              # SQLite 状态存储（去重/变更检测）
+├── push.py               # Bark / Server酱 / 邮件 推送
+├── notify.py             # 组装通知 + 主循环
+├── util.py               # 网络/日志/常量
+├── test_push.py          # 推送自检（发一条测试消息）
+├── 一键安装计划任务.bat    # 【推荐】双击即自动提权并注册"每10分钟自动监测"
+├── 启动监测.bat           # 无管理员权限时的替代：手动启动后台监测
+├── install_task.ps1      # 注册 Windows 计划任务（需管理员权限）
+├── uninstall_task.ps1    # 删除计划任务
+├── 云端部署指南.md         # 【不用开电脑】把监测放到 GitHub 免费云端
+├── .github/workflows/weather-alert.yml   # GitHub Actions 定时任务
+├── .gitignore            # 避免把含密钥的 config.json 上传
+├── state.db              # 运行后自动生成
+└── logs/                 # 运行后自动生成日志
+```
+
+---
+
+## 四、快速开始（5 步跑通"选地区 → 监测 → 手机收到预警"）
+
+### 第 1 步：准备手机推送（主渠道：Bark，iPhone 锁屏）
+
+1. 在 iPhone 的 App Store 搜索并安装 **Bark**（免费，开发者 Finb）。
+2. 打开 Bark App，首页会显示一个**推送密钥 key**（一串字符）和一条测试链接。
+3. 复制这个 **key**。
+
+> 为什么选 Bark：它基于苹果 APNs，能在**锁屏/通知中心**弹出通知，即使 App 没打开也能收到；免费、无需苹果开发者账号（$99/年）、无需自己搭服务器（用官方公共服务器 `api.day.app`），是目前"iPhone 主动通知"里最简单稳定的方案。
+
+### 第 2 步：填写配置
+
+编辑项目目录下的 `config.json`，最小改动是两处：
+
+```json
+{
+  "regions": [
+    {
+      "name": "北京",
+      "province": "北京",
+      "types": ["台风","暴雨","暴雪","寒潮","大风","雷电","冰雹","强对流","雷雨大风","大雾","道路结冰"],
+      "levels": ["橙色","红色"]
+    }
+  ],
+  "push": {
+    "bark": { "enabled": true, "server": "https://api.day.app", "key": "粘贴你的Bark key到这里" }
+  }
+}
+```
+
+- `regions`：你要关注的地区，可写多个（详细规则见下文"地区配置"）。
+- `push.bark.enabled` 改成 `true`，`key` 粘贴第 1 步复制的 key。
+
+### 第 3 步：验证推送通道
+
+在项目目录下运行（PowerShell）：
+
+```powershell
+python test_push.py
+```
+
+手机应收到一条"天气预警推送自检"的通知。收到即说明推送通道打通。
+
+### 第 4 步：先干跑看看会推什么
+
+```powershell
+python main.py --dry-run      # 只展示"将推送什么"，不实际发送、不写状态
+python main.py --status       # 查看配置，并列出各关注地区当前命中的预警
+```
+
+### 第 5 步：后台自动运行
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_task.ps1           # 每 10 分钟运行一次
+powershell -ExecutionPolicy Bypass -File .\install_task.ps1 -IntervalMinutes 5   # 每 5 分钟
+```
+
+之后无需任何操作，Windows 会定时自动监测并推送。管理/删除见下文"后台运行"。
+
+> 若你的电脑上没有把 `python` 加入 PATH，请把上面命令中的 `python` 换成你本机的 Python 绝对路径，或参考"运行方式"小节。
+
+---
+
+## 五、配置详解
+
+### 5.1 关注地区（regions）
+
+每个地区是一个对象：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `name` | ✅ | 地区名。省/市/区县均可，如 `北京`、`海淀`、`文昌市`、`阿克苏地区` |
+| `province` | 否 | 用于重名消歧。例如 `朝阳` 既可能是北京朝阳区、也可能是辽宁朝阳市，填 `province:"北京"` 即只匹配北京朝阳区 |
+| `types` | 否 | 关注的预警类型列表；`[]` 或省略 = 全部类型 |
+| `levels` | 否 | 关注的级别列表；`[]` 或省略 = 全部（蓝/黄/橙/红） |
+
+**匹配规则（重要）**：对"预警发布地区"和你的 `name` 做归一化（去掉省/市/区/县等后缀）后按"包含"匹配。
+- `name:"北京"` 会命中"北京市"以及"北京市海淀区""北京市朝阳区"等所有北京下属区县（因为都包含"北京"）。
+- `name:"海淀"` 只命中含"海淀"的地区。
+- 填了 `province` 时，预警地区必须**同时包含** `province` 和 `name` 才命中。
+
+示例（关注三个地区，规则各不同）：
+
+```json
+"regions": [
+  { "name": "北京", "province": "北京", "levels": ["橙色", "红色"] },
+  { "name": "上海", "province": "上海", "types": ["台风", "暴雨", "大风", "大雾"], "levels": [] },
+  { "name": "文昌", "province": "海南", "types": [], "levels": [] }
+]
+```
+
+> 想精确到某条班车经过的区县，就写区县名 + 所属省市。可用 `python main.py --list-provinces` 查看省级标准名称。
+
+### 5.2 预警类型（types）
+
+中央气象台现行的预警类型词汇（以标题实际出现的为准），常见的有：
+
+`台风、暴雨、暴雪、寒潮、大风、雷电、冰雹、雷雨大风、大雾、道路结冰、高温、沙尘暴、霜冻、海上大风、海上雷雨大风、地质灾害、山洪、渍涝、中小河流洪水` 等。
+
+- 注意：官方标题里"强对流"通常表现为 `雷雨大风`、`冰雹`、`雷电`；如果你关注强对流，建议同时勾选 `雷雨大风`、`冰雹`、`雷电`。
+- 类型匹配为"精确相等或互为包含"：`大风` 也会命中 `海上大风`、`海上雷雨大风`。
+
+### 5.3 预警级别（levels）
+
+`蓝色` < `黄色` < `橙色` < `红色`（严重程度递增）。留空 `[]` = 接收所有级别。
+
+### 5.4 推送渠道（push）
+
+可同时启用多个，互为备份。**至少启用一个。**
+
+#### ① Bark（iPhone 锁屏，推荐主渠道）
+
+| 字段 | 值 |
+| --- | --- |
+| `enabled` | `true` |
+| `server` | 默认 `https://api.day.app`（官方公共服务器，免费）。也可自建 Bark 服务器后改地址 |
+| `key` | Bark App 里显示的 key |
+
+级别与送达方式：蓝/黄 = 点亮屏幕即时显示；橙/红 = 时效性通知（可穿透 iOS 专注模式）。
+
+#### ② Server酱（微信推送，备用）
+
+1. 用微信扫码/登录 [Server酱 Turbo](https://sct.ftqq.com/)，在"SendKey"页拿到形如 `SCTxxxxxx` 的 SendKey。
+2. 关注它引导你关注的"方糖"服务号。
+3. 配置：
+
+```json
+"serverchan": { "enabled": true, "sendkey": "SCTxxxxxx" }
+```
+
+> 本工具同时兼容 Server酱 Turbo（微信，`SCT` 开头）与 Server酱³（App，`sctp…` 开头），按 key 前缀自动选择端点。微信渠道免费额度足够个人使用。
+
+#### ③ 邮件（备用）
+
+```json
+"email": {
+  "enabled": true,
+  "smtp_host": "smtp.qq.com",
+  "smtp_port": 465,
+  "use_ssl": true,
+  "username": "你的邮箱@qq.com",
+  "password": "QQ邮箱的授权码（不是登录密码）",
+  "to": ["接收人@qq.com"]
+}
+```
+
+> QQ 邮箱的"授权码"在 网页版 QQ 邮箱 → 设置 → 账户 → 开启 POP3/SMTP 服务 → 生成授权码。
+
+### 5.5 监测行为（poll）
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `interval_minutes` | 10 | 常驻模式/计划任务的运行间隔（分钟） |
+| `alert_page_size` | 500 | 一次拉取的预警条数（全国现行预警通常 < 600，保持默认即可） |
+| `fetch_detail` | true | 是否抓取详情页正文（预警内容/防御指南）。关闭可省请求，但通知里就少了正文 |
+| `notify_cancel` | true | 预警从生效列表消失（解除/到期）时是否推送 |
+| `notify_renewal` | false | 同地区同类型同级别**再次发布**（续报）时是否推送；默认关闭以免刷屏 |
+
+---
+
+## 六、运行方式
+
+### 6.1 单次运行（调试/手动）
+
+```powershell
+python main.py
+```
+
+### 6.2 常驻运行（前台）
+
+```powershell
+python main.py --loop
+```
+
+会按 `interval_minutes` 循环监测。缺点：关掉窗口就停了，重启电脑后需重新启动。
+
+### 6.3 Windows 计划任务（推荐，真正的"后台自动运行"）
+
+**最简单：双击 `一键安装计划任务.bat`**（会弹出 UAC 授权窗口，点"是"即可）。它会自动申请管理员权限并注册"每 10 分钟自动监测"的计划任务。
+
+若想手动执行（例如修改运行间隔）：
+
+```powershell
+# 安装（每 10 分钟自动运行，开机自启、无需登录桌面）
+powershell -ExecutionPolicy Bypass -File .\install_task.ps1
+
+# 指定间隔（例如 5 分钟）
+powershell -ExecutionPolicy Bypass -File .\install_task.ps1 -IntervalMinutes 5
+
+# 指定 Python 路径（当自动探测失败时）
+powershell -ExecutionPolicy Bypass -File .\install_task.ps1 -PythonPath "C:\路径\python.exe"
+
+# 卸载
+powershell -ExecutionPolicy Bypass -File .\uninstall_task.ps1
+```
+
+> **注意**：注册计划任务需要**管理员权限**。若提示"拒绝访问"，请改用上面的 `一键安装计划任务.bat`（会自动提权），或以管理员身份打开 PowerShell 后执行。
+>
+> **没有管理员权限时**：双击 `启动监测.bat` 即可手动启动后台监测（保持窗口打开即可；关闭窗口则停止）。
+
+安装后可在 `taskschd.msc`（任务计划程序）→ 任务计划程序库 → `WeatherAlertPush` 查看/手动"运行"/删除。
+
+> 说明：任务以"无论用户是否登录都运行"（S4U）方式注册，电脑开机即自动监测，锁屏也不影响。
+
+### 6.4 不用开电脑：GitHub 免费云端（推荐）
+
+如果你**不想让电脑一直开着**，可以把监测放到 GitHub 云端运行——你自己的电脑关不关都不影响。
+
+完整图文步骤见 **云端部署指南.md**，要点：
+
+1. 注册免费 GitHub 账号 → 新建一个 **Public** 仓库；
+2. 上传程序文件（**不要上传 config.json**）；
+3. 在 Actions 里创建 `.github/workflows/weather-alert.yml`（内容见指南，可直接复制）；
+4. 在 **Settings → Secrets and variables → Actions** 添加 `BARK_KEY`（你的密钥只存这里，不进代码库）；
+5. 手动跑一次验证，之后每 10 分钟云端自动运行。
+
+- 费用：**0 元**（公开仓库 Actions 免费无限）
+- 去重状态通过 GitHub 缓存持久化，不会重复推送
+- 工作流内置"心跳保活"，避免定时任务因长期无提交被 GitHub 停用
+
+---
+
+## 七、测试方法与已完成的实测结果
+
+### 7.1 建议按此顺序自测
+
+1. **通道自检**：`python test_push.py` → 手机收到测试消息。
+2. **干跑**：`python main.py --dry-run` → 看到"将推送"的预警列表，确认地区/级别规则符合预期。
+3. **状态核对**：`python main.py --status` → 每个关注地区当前命中几条现行预警。
+4. **真实运行**：`python main.py`（先手动跑一次）→ 手机真正收到预警；再跑一次应**不重复**推送（去重生效）。
+5. **常驻/计划任务**：安装计划任务后，观察 `logs/alerts.log` 与手机是否按间隔收到新预警。
+
+### 7.2 开发时在本机的实测结果（真实数据）
+
+| 项目 | 结果 |
+| --- | --- |
+| 数据源连通 | ✅ `findAlarm` 返回 `code:0`，拉取全国现行预警 **398 条**，全部 398 条标题解析成功 |
+| 地区命中 | ✅ 配置"海南"命中 5 条（文昌雷电黄、海口雷电黄、三沙雷雨大风黄、海上雷雨大风黄、大雾黄） |
+| 新发布推送 | ✅ 首次运行推送 5 条 |
+| 去重 | ✅ 第二次运行推送 **0 条**（同一条不重复发送） |
+| 升级判断 | ✅ 预置"蓝色"历史后，同地区同类型"黄色"被正确判为**升级**并推送 |
+| 解除判断 | ✅ 移除关注后，之前推送过的 5 条全部正确推送"解除/到期" |
+| Bark 接口 | ✅ `POST api.day.app/push` 请求格式被服务端正确识别（假 key 返回 `device token not found`，即格式无误） |
+| Server酱³ 接口 | ✅ 假 key 返回规范 JSON `{"code":10003,"error":"sendkey not found"}`（端点/格式无误） |
+| 故障主动通知 | ✅ 首次故障推送"监测异常"、连续故障不重复、恢复后推送"已恢复" |
+| 零依赖 | ✅ 全程仅用 Python 标准库，无第三方包 |
+
+> 注：本机存在 TLS 拦截代理（企业/安全软件常见），程序会自动检测证书校验失败并回退为不校验方式读取公开数据，日志中会出现一条 `HTTPS 证书校验失败…已回退` 提示，属正常现象；在无拦截的普通电脑上则直接正常校验，不会出现该提示。
+
+---
+
+## 八、所需账号 / 密钥 / 权限 / 费用
+
+| 项目 | 需要什么 | 费用 |
+| --- | --- | --- |
+| 预警数据源（中央气象台） | 无，公开接口 | ¥0 |
+| Bark（iPhone 主渠道） | 免费 App，App 内自动生成 key | ¥0（自建服务器才需一台服务器，可不自建） |
+| Server酱（微信备用） | 微信登录拿 SendKey，关注服务号 | ¥0（个人免费额度足够） |
+| 邮件（备用） | 你自己的邮箱 + 授权码 | ¥0 |
+| Windows 计划任务 | 本机管理员权限（注册计划任务用） | ¥0 |
+| **总计** | — | **约 ¥0** |
+
+> 唯一可能产生费用的情形：如果你不想用 Bark 官方公共服务器，而是自建 Bark/Server酱服务器，需要一台常开的服务器（几美元/月）。MVP 不需要。
+
+---
+
+## 九、故障处理与日志
+
+- 所有运行日志写入 `logs/alerts.log`（滚动保留 5 份，每份 2MB）。
+- 数据拉取失败：会记录错误日志，并**主动通过已启用的推送渠道发送一条"监测异常"通知**（同一故障只发一次、不刷屏）；恢复正常后会再发一条"已恢复"通知。
+- 单条推送失败：会记录日志，并在**下一轮自动重试**（不会丢）。
+- "系统停止运行"（进程被关/未开机）：Windows 计划任务已配置为"开机自启 + 无论是否登录都运行"；若要自动重启失败任务，可在任务计划程序里对 `WeatherAlertPush` 启用"如果任务失败，重新启动"。本工具每轮结束会更新 `last_run_at` 到 `state.db`。
+
+常见问题：
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `test_push.py` 手机没收到 | 检查 Bark key 是否粘贴正确、手机通知权限是否开启、网络是否可达 `api.day.app` |
+| 一条预警反复收到 | 正常情况下不会（有 alertid 去重）。若改了 `notify_renewal=true`，同级别续报会每次推送，属预期 |
+| 中文乱码 | 日志/推送均为 UTF-8，控制台已自动切换 UTF-8；如仍乱码，用 `chcp 65001` 后重试 |
+| 日志出现"HTTPS 证书校验失败…已回退" | 本机有 TLS 拦截代理，程序已自动回退，不影响使用 |
+| 红色预警想穿透勿扰模式响铃 | 把 `push.py` 里 `BARK_LEVEL` 的"红色"改成 `critical`，并在 iOS 设置→通知→Bark 开启"重要警告" |
+
+---
+
+## 十、免责声明
+
+本工具仅用于**个人/企业内部**对公开气象预警信息的辅助订阅与提醒。预警数据来自国家气象中心/中央气象台公开接口，作者不对数据的可用性、准确性、及时性作任何保证，也**未获官方授权**、不代表官方。遇到强降水、台风、强对流、暴雪、大风等风险场景时，请以最新官方预警、主管部门通知和现场实际情况为准。请遵守目标网站规则与所在地法律法规，勿用于高并发批量采集。
+
+---
+
+## 附：一键命令速查
+
+```powershell
+cd 到本目录
+
+python main.py --list-provinces    # 查省级标准名称
+python main.py --status            # 看配置 + 当前命中
+python main.py --dry-run           # 干跑（不发送）
+python main.py                     # 单次运行（真实推送）
+python main.py --loop              # 常驻循环
+python test_push.py                # 推送自检
+
+powershell -ExecutionPolicy Bypass -File .\install_task.ps1     # 注册计划任务
+powershell -ExecutionPolicy Bypass -File .\uninstall_task.ps1   # 删除计划任务
+```
